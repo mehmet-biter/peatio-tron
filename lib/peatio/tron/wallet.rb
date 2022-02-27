@@ -1,7 +1,6 @@
 module Peatio
   module Tron
     class Wallet < Peatio::Wallet::Abstract
-      include Common
       include Encryption
 
       DEFAULT_FEE = { fee_limit: 1000000 }
@@ -26,35 +25,34 @@ module Peatio
       end
 
       def create_address!(options = {})
-        client
-          .json_rpc(path: 'wallet/generateaddress')
-          .yield_self { |pa| { address: pa.fetch('address'), secret: pa.fetch('privateKey') } }
-      rescue Tron::Client::Error => exception
-        raise Peatio::Wallet::ClientError, exception
+        client.json_rpc(path: 'wallet/generateaddress')
+              .yield_self { |r| { address: r.fetch('address'), secret: r.fetch('privateKey') } }
+      rescue Tron::Client::Error => e
+        raise Peatio::Wallet::ClientError, e
       end
 
       def create_transaction!(transaction, options = {})
-        if is_trc10?(@currency)
+        if @currency.dig(:options, :trc10_token_id).present?
           create_trc10_transaction!(transaction)
-        elsif is_trc20?(@currency)
+        elsif @currency.dig(:options, :trc20_contract_address).present?
           create_trc20_transaction!(transaction, options)
         else
           create_coin_transaction!(transaction, options)
         end
-      rescue Tron::Client::Error => exception
-        raise Peatio::Wallet::ClientError, exception
+      rescue Tron::Client::Error => e
+        raise Peatio::Wallet::ClientError, e
       end
 
       def prepare_deposit_collection!(transaction, deposit_spread, deposit_currency)
-        # skip deposit_collection in case of trx(coin) deposit.
+        # Don't prepare for deposit_collection in case of coin(tron) deposit.
         return [] if is_coin?(deposit_currency)
         return [] if deposit_spread.blank?
 
         options = DEFAULT_FEE.merge(deposit_currency.fetch(:options).slice(:fee_limit))
 
-        # Collect fees depending on the number of spread deposit size
-        # Example: if deposit spreads on three wallets need to collect trx fee for 3 transactions
-        fees = from_base_unit(options.fetch(:fee_limit).to_i, @currency)
+        # We collect fees depending on the number of spread deposit size
+        # Example: if deposit spreads on three wallets need to collect tron fee for 3 transactions
+        fees = convert_from_base_unit(options.fetch(:fee_limit).to_i)
         transaction.amount = fees * deposit_spread.size
 
         [create_coin_transaction!(transaction)]
@@ -63,39 +61,51 @@ module Peatio
       end
 
       def load_balance!
-        if is_trc10?(@currency)
-          load_trc10_balance(@wallet.fetch(:address), @currency)
-        elsif is_trc20?(@currency)
-          load_trc20_balance(@wallet.fetch(:address), @currency)
+        if @currency.dig(:options, :trc10_token_id).present?
+          client.json_rpc(path: 'wallet/getaccount',
+                          params: { address: refactor_decode_address(@wallet.fetch(:address)) }
+          ).fetch('assetV2', [])
+                .find { |a| a['key'] == @currency[:options][:trc10_token_id] }
+                .try(:fetch, 'value', 0)
+        elsif @currency.dig(:options, :trc20_contract_address).present?
+          client.json_rpc(path: 'wallet/triggersmartcontract',
+                          params: {
+                            owner_address: refactor_decode_address(@wallet.fetch(:address)),
+                            contract_address: refactor_decode_address(@currency.dig(:options, :trc20_contract_address)),
+                            function_selector: 'balanceOf(address)',
+                            parameter: abi_encode(refactor_decode_address(@wallet.fetch(:address))[2..42]) }
+          ).fetch('constant_result')[0].hex
         else
-          load_coin_balance(@wallet.fetch(:address))
-        end.yield_self { |amount| from_base_unit(amount.to_i, @currency) }
-      rescue Tron::Client::Error => exception
-        raise Peatio::Wallet::ClientError, exception
+          client.json_rpc(path: 'wallet/getaccount',
+                          params: { address: refactor_decode_address(@wallet.fetch(:address)) }
+          ).fetch('balance', nil)
+        end.yield_self { |amount| convert_from_base_unit(amount.to_i) }
+      rescue Tron::Client::Error => e
+        raise Peatio::Wallet::ClientError, e
       end
 
       private
 
       def create_trc10_transaction!(transaction, options = {})
-        amount = to_base_unit(transaction.amount)
+        currency_options = @currency.fetch(:options).slice(:trc10_token_id)
+        options.merge!(currency_options)
 
-        txid = client
-                 .json_rpc(
-                   path: 'wallet/easytransferassetbyprivate',
-                   params: {
-                     privateKey: @wallet.fetch(:secret),
-                     toAddress: decode_address(transaction.to_address),
-                     assetId: asset_id(@currency),
-                     amount: amount
-                   })
-                 .dig('transaction', 'txID')
-                 .yield_self { |txid| reformat_txid(txid) }
+        amount = convert_to_base_unit(transaction.amount)
+
+        txid = client.json_rpc(path: 'wallet/easytransferassetbyprivate',
+                               params: {
+                                 privateKey: @wallet.fetch(:secret),
+                                 toAddress: refactor_decode_address(transaction.to_address),
+                                 assetId: currency_options.fetch(:trc10_token_id),
+                                 amount: amount
+                               }).dig('transaction', 'txID')
+                     .yield_self { |txid| refactor_txid(txid) }
 
         unless txid
           raise Peatio::Wallet::ClientError, \
               "Withdrawal from #{@wallet.fetch(:address)} to #{transaction.to_address} failed."
         end
-        transaction.hash = reformat_txid(txid)
+        transaction.hash = refactor_txid(txid)
         transaction
       end
 
@@ -103,11 +113,13 @@ module Peatio
         currency_options = @currency.fetch(:options).slice(:trc20_contract_address, :fee_limit)
         options.merge!(DEFAULT_FEE, currency_options)
 
-        amount = to_base_unit(transaction.amount)
+        amount = convert_to_base_unit(transaction.amount)
 
         signed_txn = sign_transaction(transaction, amount, options)
 
-        response = client.json_rpc(path: 'wallet/broadcasttransaction', params: signed_txn)
+        # broadcast txn
+        response = client.json_rpc(path: 'wallet/broadcasttransaction',
+                                   params: signed_txn)
 
         txid = response.fetch('result', false) ? signed_txn.fetch('txID') : nil
 
@@ -115,52 +127,57 @@ module Peatio
           raise Peatio::Wallet::ClientError, \
               "Withdrawal from #{@wallet.fetch(:address)} to #{transaction.to_address} failed."
         end
-        transaction.hash = reformat_txid(txid)
+        transaction.hash = refactor_txid(txid)
         transaction
       end
 
       def create_coin_transaction!(transaction, options = {})
-        amount = to_base_unit(transaction.amount)
-        txid = client
-                 .json_rpc(path: 'wallet/easytransferbyprivate',
-                   params: {
-                     privateKey: @wallet.fetch(:secret),
-                     toAddress: decode_address(transaction.to_address),
-                     amount: amount })
-                 .dig('transaction', 'txID')
-                 .yield_self { |txid| reformat_txid(txid) }
+        amount = convert_to_base_unit(transaction.amount)
+        txid = client.json_rpc(path: 'wallet/easytransferbyprivate',
+                               params: {
+                                 privateKey: @wallet.fetch(:secret),
+                                 toAddress: refactor_decode_address(transaction.to_address),
+                                 amount: amount
+                               }).dig('transaction', 'txID')
+                     .yield_self { |txid| refactor_txid(txid) }
 
         unless txid
           raise Peatio::Wallet::ClientError, \
               "Withdrawal from #{@wallet.fetch(:address)} to #{transaction.to_address} failed."
         end
-        transaction.amount = from_base_unit(amount, @currency)
-        transaction.hash = reformat_txid(txid)
+        transaction.amount = convert_from_base_unit(amount)
+        transaction.hash = refactor_txid(txid)
         transaction
       end
 
       def sign_transaction(transaction, amount, options)
-        client
-          .json_rpc(path: 'wallet/gettransactionsign',
-            params: {
-              transaction: trigger_smart_contract(transaction, amount, options),
-              privateKey: @wallet.fetch(:secret) }
-          )
+        client.json_rpc(path: 'wallet/gettransactionsign',
+                        params: {
+                          transaction: trigger_smart_contract(transaction, amount, options),
+                          privateKey: @wallet.fetch(:secret)
+                        })
       end
 
       def trigger_smart_contract(transaction, amount, options)
-        client
-          .json_rpc(path: 'wallet/triggersmartcontract',
-            params: {
-              contract_address: decode_address(options.fetch(:trc20_contract_address)),
-              function_selector: 'transfer(address,uint256)',
-              parameter: abi_encode(decode_address(transaction.to_address)[2..42], amount.to_s(16)),
-              fee_limit: options.fetch(:fee_limit),
-              owner_address: decode_address(@wallet.fetch(:address)) })
-          .fetch('transaction')
+        client.json_rpc(path: 'wallet/triggersmartcontract',
+                        params: {
+                          contract_address: refactor_decode_address(options.fetch(:trc20_contract_address)),
+                          function_selector: 'transfer(address,uint256)',
+                          parameter: abi_encode(refactor_decode_address(transaction.to_address)[2..42], amount.to_s(16)),
+                          fee_limit: options.fetch(:fee_limit),
+                          owner_address: refactor_decode_address(@wallet.fetch(:address))
+                        }).fetch('transaction')
       end
 
-      def to_base_unit(value)
+      def is_coin?(deposit_currency)
+        deposit_currency.dig(:options, :trc20_contract_address).blank?
+      end
+
+      def convert_from_base_unit(value)
+        value.to_d / @currency.fetch(:base_factor)
+      end
+
+      def convert_to_base_unit(value)
         x = value.to_d * @currency.fetch(:base_factor)
         unless (x % 1).zero?
           raise Peatio::Wallet::ClientError,
@@ -171,11 +188,8 @@ module Peatio
       end
 
       def client
-        @client ||= Client.new(get_settings(:uri))
-      end
-
-      def get_settings(key)
-        @wallet.fetch(key) { raise Peatio::Wallet::MissingSettingError, key.to_s }
+        uri = @wallet.fetch(:uri) { raise Peatio::Wallet::MissingSettingError, :uri }
+        @client ||= Client.new(uri)
       end
     end
   end

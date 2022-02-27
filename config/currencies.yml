@@ -36,7 +36,7 @@
   position: 4
   options:
     # TRC10 configuration.
-    trc10_asset_id: '1000016'
+    trc10_token_id: '1000016'
 
 - id: jst
   name: JUST GOV TOKEN

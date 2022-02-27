@@ -9,7 +9,6 @@ module Peatio
     require "bigdecimal"
     require "bigdecimal/util"
     require "digest/sha3"
-    require "peatio/tron/concerns/common"
     require "peatio/tron/concerns/encryption"
     require "peatio/tron/blockchain"
     require "peatio/tron/client"
