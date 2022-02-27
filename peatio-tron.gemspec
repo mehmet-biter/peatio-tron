@@ -25,7 +25,7 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency "activesupport", "~> 5.2.3"
   spec.add_dependency "better-faraday", "~> 1.0.5"
-  spec.add_dependency "faraday", "~> 0.17.4"
+  spec.add_dependency "faraday", "~> 0.17.3"
   spec.add_dependency "memoist", "~> 0.16.0"
   spec.add_dependency "digest-sha3", "~> 1.1.0"
   spec.add_dependency "ed25519"
